@@ -559,7 +559,7 @@ export function Home() {
                       className="w-full h-full object-cover"
                       loop
                       playsInline
-                      preload="metadata"
+                      preload="auto"
                     />
                   </div>
 
