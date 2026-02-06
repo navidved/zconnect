@@ -8,6 +8,9 @@ dist/
 # Raw source reels (not needed for deploy)
 reels/
 
+# Videos served from Cloudinary CDN
+public/videos/
+
 # Environment files
 .env
 .env.local
