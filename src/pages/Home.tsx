@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { MainLayout } from '../components/MainLayout';
 import { UnifiedAssistant } from '../components/UnifiedAssistant';
 import { CreateContent } from '../components/CreateContent';
@@ -37,6 +37,43 @@ interface Product {
   creatorVideos: CreatorVideo[];
 }
 
+// Network quality detection
+type NetworkQuality = 'high' | 'medium' | 'low';
+
+interface NetworkInfo {
+  effectiveType?: string;
+  downlink?: number;
+  saveData?: boolean;
+}
+
+function getNetworkQuality(): NetworkQuality {
+  const conn = (navigator as any).connection as NetworkInfo | undefined;
+  if (!conn) return 'high'; // Default to high if API not available
+
+  if (conn.saveData) return 'low';
+
+  const effectiveType = conn.effectiveType;
+  if (effectiveType === '4g' && (conn.downlink ?? 10) >= 5) return 'high';
+  if (effectiveType === '4g' || effectiveType === '3g') return 'medium';
+  return 'low'; // 2g, slow-2g
+}
+
+// Cloudinary adaptive URL builder
+function getOptimizedVideoUrl(originalUrl: string, quality: NetworkQuality): string {
+  // Original URL format: .../upload/f_auto,q_auto/v.../filename.mp4
+  // We replace the transformation segment with adaptive params
+  const transformMap: Record<NetworkQuality, string> = {
+    high: 'f_auto,q_auto,w_720,br_2500k',
+    medium: 'f_auto,q_auto:eco,w_480,br_1000k',
+    low: 'f_auto,q_auto:low,w_360,br_500k',
+  };
+
+  return originalUrl.replace(
+    /\/upload\/[^/]+\//,
+    `/upload/${transformMap[quality]}/`
+  );
+}
+
 export function Home() {
   const [showSearch, setShowSearch] = useState(false);
   const [showAssistant, setShowAssistant] = useState(false);
@@ -48,9 +85,20 @@ export function Home() {
   const [currentCreatorIndices, setCurrentCreatorIndices] = useState<{ [key: number]: number }>({});
   const [isLiked, setIsLiked] = useState(false);
   const [isBookmarked, setIsBookmarked] = useState(false);
+  const [networkQuality, setNetworkQuality] = useState<NetworkQuality>(getNetworkQuality);
   const verticalScrollRef = useRef<HTMLDivElement>(null);
   const horizontalScrollRefs = useRef<{ [key: number]: HTMLDivElement | null }>({});
   const videoRefs = useRef<{ [key: string]: HTMLVideoElement | null }>({});
+  const preloadedUrls = useRef<Set<string>>(new Set());
+
+  // Listen for network changes and adapt quality
+  useEffect(() => {
+    const conn = (navigator as any).connection;
+    if (!conn) return;
+    const handler = () => setNetworkQuality(getNetworkQuality());
+    conn.addEventListener('change', handler);
+    return () => conn.removeEventListener('change', handler);
+  }, []);
 
   const products: Product[] = [
     // ── Product 1: Action Figures ──
@@ -422,6 +470,18 @@ export function Home() {
     },
   ];
 
+  // Memoized function to get optimized video URL
+  const getVideoSrc = useCallback(
+    (originalUrl: string) => getOptimizedVideoUrl(originalUrl, networkQuality),
+    [networkQuality]
+  );
+
+  // Determine which products are "near" (should have video elements mounted)
+  const isProductNear = useCallback(
+    (productIdx: number) => Math.abs(productIdx - currentProductIndex) <= 1,
+    [currentProductIndex]
+  );
+
   const currentProduct = products[currentProductIndex] || products[0];
   const currentCreatorIndex = currentCreatorIndices[currentProduct?.id] || 0;
   const currentVideo = currentProduct?.creatorVideos?.[currentCreatorIndex] || currentProduct?.creatorVideos?.[0];
@@ -431,6 +491,40 @@ export function Home() {
     setIsLiked(false);
     setIsBookmarked(false);
   }, [currentProductIndex, currentCreatorIndex]);
+
+  // Preload upcoming videos in background
+  useEffect(() => {
+    const preloadVideo = (url: string) => {
+      const optimized = getOptimizedVideoUrl(url, networkQuality);
+      if (preloadedUrls.current.has(optimized)) return;
+      preloadedUrls.current.add(optimized);
+
+      const link = document.createElement('link');
+      link.rel = 'prefetch';
+      link.as = 'video';
+      link.href = optimized;
+      link.crossOrigin = 'anonymous';
+      document.head.appendChild(link);
+    };
+
+    // Preload current product videos
+    const curr = products[currentProductIndex];
+    if (curr) {
+      curr.creatorVideos.forEach((v) => preloadVideo(v.videoUrl));
+    }
+
+    // Preload next product's first video
+    const next = products[currentProductIndex + 1];
+    if (next && next.creatorVideos[0]) {
+      preloadVideo(next.creatorVideos[0].videoUrl);
+    }
+
+    // Preload prev product's first video
+    const prev = products[currentProductIndex - 1];
+    if (prev && prev.creatorVideos[0]) {
+      preloadVideo(prev.creatorVideos[0].videoUrl);
+    }
+  }, [currentProductIndex, networkQuality]);
 
   // Play/pause videos based on current visible one
   useEffect(() => {
@@ -546,21 +640,30 @@ export function Home() {
               className="w-full h-full overflow-x-scroll snap-x snap-mandatory flex"
               style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
             >
-              {product.creatorVideos.map((video, videoIdx) => (
+              {product.creatorVideos.map((video, videoIdx) => {
+                const productIdx = products.indexOf(product);
+                const isCurrent = productIdx === currentProductIndex && videoIdx === (currentCreatorIndices[product.id] || 0);
+                const shouldMount = isProductNear(productIdx);
+
+                return (
                 <div
                   key={video.creatorId}
                   className="w-full h-full flex-shrink-0 snap-start snap-always relative"
                 >
                   {/* Background Video */}
                   <div className="absolute inset-0">
-                    <video
-                      ref={(el) => { videoRefs.current[`${product.id}-${videoIdx}`] = el; }}
-                      src={video.videoUrl}
-                      className="w-full h-full object-cover"
-                      loop
-                      playsInline
-                      preload="auto"
-                    />
+                    {shouldMount ? (
+                      <video
+                        ref={(el) => { videoRefs.current[`${product.id}-${videoIdx}`] = el; }}
+                        src={getVideoSrc(video.videoUrl)}
+                        className="w-full h-full object-cover"
+                        loop
+                        playsInline
+                        preload={isCurrent ? 'auto' : 'metadata'}
+                      />
+                    ) : (
+                      <div className="w-full h-full bg-neutral-900" />
+                    )}
                   </div>
 
                   {/* Gradient Overlay */}
@@ -691,7 +794,8 @@ export function Home() {
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         ))}
